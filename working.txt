@@ -1,0 +1,347 @@
+"""
+toolbox.py (Updated - image OR soil mode, robust Grad-CAM, SHAP + CORS for Flutter Web)
+
+Usage:
+    python toolbox.py audit
+    python toolbox.py runserver --host 0.0.0.0 --port 8000
+    python toolbox.py test_request --image sample_images/example.jpg
+"""
+
+import sys
+import os
+import io
+import base64
+import argparse
+import json
+import datetime
+import uuid
+from pathlib import Path
+
+# ------- Ensure required packages -------
+def ensure_packages(packages):
+    import importlib
+    import subprocess
+    missing = []
+    for pkg in packages:
+        try:
+            importlib.import_module(pkg)
+        except Exception:
+            missing.append(pkg)
+    if not missing:
+        return
+    print("Installing missing packages:", missing)
+    subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+
+ensure_packages([
+    "tensorflow", "numpy", "Pillow", "opencv_python", "joblib",
+    "fastapi", "uvicorn", "xgboost", "shap", "requests", "pandas", "python-multipart"
+])
+
+# Heavy imports
+import numpy as np
+from PIL import Image
+import cv2
+import joblib
+import tensorflow as tf
+from tensorflow.keras.models import load_model, Model
+from fastapi import FastAPI, File, UploadFile, Request
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware  # CORS
+import uvicorn
+import shap
+import xgboost
+
+# ---------------- Config ----------------
+MODELS_DIR = Path("models")
+CNN_PATH = MODELS_DIR / "Cnn_model.h5"
+XGB_PATH = MODELS_DIR / "xgboost_soil_health_model.pkl"
+
+DEFAULT_IMG_SIZE = (224, 224)
+CLASS_LABELS = ["healthy", "diseased"]
+
+# Soil features
+SOIL_FEATURES = [
+    "PH", "EC ds/m", "OC %", "N kg/hectre", "P kg/hectre", "K kg/hectre",
+    "S ppm", "Zn ppm", "B ppm", "Fe ppm", "Mn ppm", "Cu ppm"
+]
+
+def clean_key(s):
+    return s.replace(" ", "_").replace("/", "_").replace("%", "_pct")
+
+SOIL_KEYS = [clean_key(f) for f in SOIL_FEATURES]
+
+# Advice mapping
+ADVICE_MAP = {
+    "Low": {
+        "healthy": "Plant/soil looks healthy. Keep regular care and monitor.",
+        "diseased": "Minor signs detected but low severity. Remove affected parts and watch closely."
+    },
+    "Medium": {
+        "healthy": "Uncertain result. Re-check in a few days and ensure proper care.",
+        "diseased": "Moderate issue. Consider targeted treatment and monitor spread."
+    },
+    "High": {
+        "healthy": "High anomaly detected despite 'healthy' label — seek expert advice.",
+        "diseased": "High severity: isolate affected plants, remove damaged tissue, consult an expert."
+    }
+}
+
+# ----------------- Model loaders -----------------
+def load_cnn():
+    if not CNN_PATH.exists():
+        raise FileNotFoundError(f"Could not find {CNN_PATH}")
+    print("Loading CNN from", CNN_PATH)
+    model = load_model(str(CNN_PATH))
+    return model
+
+def load_xgb():
+    if not XGB_PATH.exists():
+        raise FileNotFoundError(f"Could not find {XGB_PATH}")
+    print("Loading XGBoost from", XGB_PATH)
+    model = joblib.load(str(XGB_PATH))
+    return model
+
+# ---------------- Audit ----------------
+def audit_models():
+    print("=== MODEL AUDIT ===")
+    try:
+        cnn = load_cnn()
+        print("\n--- CNN Summary ---")
+        cnn.summary()
+        last_conv = None
+        for layer in reversed(cnn.layers):
+            if "conv" in layer.name.lower():
+                last_conv = layer.name
+                break
+        print("Last conv layer:", last_conv)
+    except Exception as e:
+        print("CNN load error:", e)
+
+    try:
+        xgb = load_xgb()
+        print("\n--- XGBoost Info ---")
+        booster = xgb.get_booster()
+        print("Feature names:", booster.feature_names)
+    except Exception as e:
+        print("XGB load error:", e)
+
+    print("\n=== AUDIT COMPLETE ===\n")
+
+# ---------------- Grad-CAM ----------------
+def make_gradcam_heatmap(img_array, model, last_conv_layer_name=None, class_index=None, IMG_SIZE=DEFAULT_IMG_SIZE):
+    if last_conv_layer_name is None:
+        for layer in reversed(model.layers):
+            if "conv" in layer.name.lower():
+                last_conv_layer_name = layer.name
+                break
+    if last_conv_layer_name is None:
+        raise ValueError("No conv layer found.")
+
+    x = tf.convert_to_tensor(img_array, dtype=tf.float32)
+    conv_outputs = None
+    out = x
+    with tf.GradientTape() as tape:
+        for layer in model.layers:
+            out = tf.keras.backend.function([model.input], [layer.output])([out])[0] if "function" in dir(tf.keras.backend) else layer(out)
+            if layer.name == last_conv_layer_name:
+                conv_outputs = out
+                tape.watch(conv_outputs)
+        preds = out
+        if class_index is None:
+            class_index = tf.argmax(preds[0])
+        loss = preds[:, class_index]
+
+    grads = tape.gradient(loss, conv_outputs)
+    if grads is None:
+        raise RuntimeError("Gradients are None.")
+    grads = grads[0]
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1))
+    conv_out = conv_outputs[0]
+    cam = tf.reduce_sum(pooled_grads * conv_out, axis=-1)
+    cam = tf.maximum(cam, 0)
+    cam = cam / (tf.reduce_max(cam) + 1e-8)
+    cam = cam.numpy()
+    cam = cv2.resize(cam, (IMG_SIZE[1], IMG_SIZE[0]))
+    return cam, int(class_index)
+
+def overlay_heatmap_on_pil(img_pil, heatmap, alpha=0.4):
+    img = np.array(img_pil.resize((heatmap.shape[1], heatmap.shape[0]))).astype("uint8")
+    heatmap_uint8 = np.uint8(255 * heatmap)
+    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+    overlay = cv2.addWeighted(heatmap_color, alpha, img, 1 - alpha, 0)
+    return Image.fromarray(overlay)
+
+# ---------------- FastAPI App with CORS ----------------
+def create_app():
+    cnn = None
+    embed_model = None
+    xgb = None
+    shap_explainer = None
+    last_conv_layer = None
+
+    print("Loading models for server...")
+
+    # Load CNN
+    try:
+        cnn = load_cnn()
+        try:
+            embed_model = Model(inputs=cnn.input, outputs=cnn.get_layer("global_average_pooling2d").output)
+        except:
+            embed_model = Model(inputs=cnn.input, outputs=cnn.layers[-2].output)
+        for layer in reversed(cnn.layers):
+            if "conv" in layer.name.lower():
+                last_conv_layer = layer.name
+                break
+        print("Last conv layer set to:", last_conv_layer)
+    except Exception as e:
+        print("CNN load error:", e)
+
+    # Load XGBoost
+    try:
+        xgb = load_xgb()
+    except Exception as e:
+        print("XGB load error:", e)
+
+    # SHAP Explainer
+    if xgb is not None:
+        try:
+            bg_path = MODELS_DIR / "background.npy"
+            background = np.load(str(bg_path)) if bg_path.exists() else np.zeros((1, len(SOIL_FEATURES)))
+            shap_explainer = shap.TreeExplainer(xgb, data=background)
+            print("SHAP explainer ready.")
+        except Exception as e:
+            print("SHAP init error:", e)
+
+    # FastAPI App + CORS
+    app = FastAPI()
+
+    # CORS Middleware (Critical for Flutter Web)
+    app.add_middleware(
+        CORSMiddleware,
+       allow_origins=["*"],  # Allow all origins (dev only)
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.get("/")
+    async def root():
+        return {"status": "ok", "note": "POST /predict with image or soil data"}
+
+    @app.post("/predict")
+    async def predict(request: Request, image: UploadFile = File(None)):
+        form = await request.form()
+        soil_vals = []
+        soil_present = False
+        for key in SOIL_KEYS:
+            v = form.get(key) or form.get(SOIL_FEATURES[SOIL_KEYS.index(key)])
+            if v and str(v).strip():
+                soil_present = True
+            try:
+                soil_vals.append(float(v) if v else 0.0)
+            except:
+                soil_vals.append(0.0)
+
+        image_present = image is not None
+
+        if not image_present and not soil_present:
+            return JSONResponse({"error": "Provide image or soil data"}, status_code=400)
+
+        # IMAGE MODE
+        if image_present and cnn is not None:
+            contents = await image.read()
+            try:
+                img_pil = Image.open(io.BytesIO(contents)).convert("RGB")
+            except:
+                return JSONResponse({"error": "Invalid image"}, status_code=400)
+
+            H, W = DEFAULT_IMG_SIZE
+            img_resized = img_pil.resize((W, H))
+            x_img = np.expand_dims(np.array(img_resized).astype("float32") / 255.0, 0)
+
+            preds = cnn.predict(x_img)[0]
+            idx = int(np.argmax(preds))
+            conf = float(np.max(preds))
+            label = CLASS_LABELS[idx] if idx < len(CLASS_LABELS) else str(idx)
+
+            overlay_b64 = None
+            try:
+                heatmap, _ = make_gradcam_heatmap(x_img, cnn, last_conv_layer, idx, (H, W))
+                overlay = overlay_heatmap_on_pil(img_pil, heatmap)
+                buff = io.BytesIO()
+                overlay.save(buff, format="PNG")
+                overlay_b64 = base64.b64encode(buff.getvalue()).decode()
+            except Exception as e:
+                print("Grad-CAM error:", e)
+
+            severity = "Low" if label == "healthy" else ("High" if conf > 0.85 else "Medium")
+            advice = ADVICE_MAP.get(severity, {}).get(label.lower(), "Monitor plant health.")
+
+            return {
+                "model_used": "image",
+                "label": label,
+                "confidence": conf,
+                "severity": severity,
+                "advice": advice,
+                "gradcam_overlay_b64": overlay_b64
+            }
+
+        # SOIL MODE
+        if soil_present and xgb is not None:
+            model_input = np.array(soil_vals, dtype="float32").reshape(1, -1)
+            try:
+                probs = xgb.predict_proba(model_input)[0]
+                idx = int(np.argmax(probs))
+                conf = float(np.max(probs))
+                label = CLASS_LABELS[idx] if idx < len(CLASS_LABELS) else str(idx)
+            except:
+                label = "unknown"
+                conf = 0.0
+
+            shap_top = None
+            if shap_explainer:
+                try:
+                    sv = shap_explainer.shap_values(model_input)
+                    arr = np.array(sv[0] if isinstance(sv, list) else sv).flatten()
+                    idxs = np.argsort(np.abs(arr))[-3:][::-1]
+                    shap_top = [{"feature": SOIL_FEATURES[i], "shap_value": float(arr[i])} for i in idxs]
+                except Exception as e:
+                    print("SHAP error:", e)
+
+            severity = "Low" if label == "healthy" else "High"
+            advice = ADVICE_MAP.get(severity, {}).get(label.lower(), "Consult agronomist.")
+
+            return {
+                "model_used": "soil",
+                "soil_label": label,
+                "soil_confidence": conf,
+                "severity": severity,
+                "advice": advice,
+                "shap_top_features": shap_top
+            }
+
+        return JSONResponse({"error": "No model available"}, status_code=500)
+
+    return app
+
+# ---------------- CLI ----------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("mode", choices=["audit", "runserver", "test_request"])
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", default=8000, type=int)
+    parser.add_argument("--image", help="Image path for test")
+    args = parser.parse_args()
+
+    if args.mode == "audit":
+        audit_models()
+    elif args.mode == "runserver":
+        app = create_app()
+        print(f"Starting server on {args.host}:{args.port} ...")
+        uvicorn.run(app, host=args.host, port=args.port)
+    elif args.mode == "test_request":
+        # Add test logic if needed
+        pass
+
+if __name__ == "__main__":
+    main()
