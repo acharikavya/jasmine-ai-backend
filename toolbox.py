@@ -11,6 +11,9 @@ uvicorn toolbox:create_app --host 0.0.0.0 --port $PORT --factory
 import os
 import io
 import base64
+import cv2
+import shap
+from fastapi.responses import JSONResponse
 from pathlib import Path
 
 import numpy as np
@@ -131,60 +134,133 @@ def create_app():
                 status_code=400,
             )
 
-        # =========================
-        # IMAGE MODE
-        # =========================
-        if image_present and cnn is not None:
-            contents = await image.read()
+        
+# IMAGE MODE WITH GRADCAM
+# =========================
+if image_present and cnn is not None:
+    contents = await image.read()
 
-            try:
-                img = Image.open(io.BytesIO(contents)).convert("RGB")
-            except:
-                return JSONResponse({"error": "Invalid image"}, status_code=400)
+    try:
+        img = Image.open(io.BytesIO(contents)).convert("RGB")
+    except:
+        return JSONResponse({"error": "Invalid image"}, status_code=400)
 
-            img_resized = img.resize(DEFAULT_IMG_SIZE)
-            img_array = np.array(img_resized).astype("float32") / 255.0
-            img_array = np.expand_dims(img_array, axis=0)
+    img_resized = img.resize(DEFAULT_IMG_SIZE)
+    img_array = np.array(img_resized).astype("float32") / 255.0
+    img_array = np.expand_dims(img_array, axis=0)
 
-            preds = cnn.predict(img_array)[0]
-            idx = int(np.argmax(preds))
-            confidence = float(np.max(preds))
-            label = CLASS_LABELS[idx]
+    preds = cnn.predict(img_array)[0]
+    idx = int(np.argmax(preds))
+    confidence = float(np.max(preds))
+    label = CLASS_LABELS[idx]
 
-            severity = "Low" if label == "healthy" else (
-                "High" if confidence > 0.85 else "Medium"
+    severity = "Low" if label == "healthy" else (
+        "High" if confidence > 0.85 else "Medium"
+    )
+
+    # -------- GRADCAM --------
+    gradcam_overlay_b64 = None
+    try:
+        # Find last conv layer
+        last_conv_layer = None
+        for layer in reversed(cnn.layers):
+            if "conv" in layer.name.lower():
+                last_conv_layer = layer.name
+                break
+
+        if last_conv_layer:
+            grad_model = tf.keras.models.Model(
+                [cnn.inputs],
+                [cnn.get_layer(last_conv_layer).output, cnn.output]
             )
 
-            return {
-                "model_used": "image",
-                "label": label,
-                "confidence": confidence,
-                "severity": severity
+            with tf.GradientTape() as tape:
+                conv_outputs, predictions = grad_model(img_array)
+                loss = predictions[:, idx]
+
+            grads = tape.gradient(loss, conv_outputs)
+            pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+
+            conv_outputs = conv_outputs[0]
+            heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
+            heatmap = tf.squeeze(heatmap)
+
+            heatmap = np.maximum(heatmap, 0) / (np.max(heatmap) + 1e-8)
+            heatmap = cv2.resize(heatmap.numpy(), DEFAULT_IMG_SIZE)
+
+            heatmap_uint8 = np.uint8(255 * heatmap)
+            heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+
+            overlay = cv2.addWeighted(
+                np.array(img_resized),
+                0.6,
+                heatmap_color,
+                0.4,
+                0
+            )
+
+            buff = io.BytesIO()
+            Image.fromarray(overlay).save(buff, format="PNG")
+            gradcam_overlay_b64 = base64.b64encode(buff.getvalue()).decode()
+
+    except Exception as e:
+        print("GradCAM error:", e)
+
+   return JSONResponse({
+    "model_used": "image",
+    "label": label,
+    "confidence": float(confidence),
+    "severity": severity,
+    "gradcam_overlay_b64": gradcam_overlay_b64 if gradcam_overlay_b64 else None
+})
+
+
+        
+# SOIL MODE WITH SHAP
+# =========================
+if soil_present and xgb is not None:
+    model_input = np.array(soil_values).reshape(1, -1)
+
+    try:
+        probs = xgb.predict_proba(model_input)[0]
+        idx = int(np.argmax(probs))
+        confidence = float(np.max(probs))
+        label = CLASS_LABELS[idx]
+    except:
+        label = "unknown"
+        confidence = 0.0
+
+    severity = "Low" if label == "healthy" else "High"
+
+    shap_top_features = None
+    try:
+        explainer = shap.TreeExplainer(xgb)
+        shap_values = explainer.shap_values(model_input)
+
+        values = shap_values[0] if isinstance(shap_values, list) else shap_values
+        values = values.flatten()
+
+        top_indices = np.argsort(np.abs(values))[-3:][::-1]
+
+        shap_top_features = [
+            {
+                "feature": SOIL_FEATURES[i],
+                "shap_value": float(values[i])
             }
+            for i in top_indices
+        ]
+    except Exception as e:
+        print("SHAP error:", e)
 
-        # =========================
-        # SOIL MODE
-        # =========================
-        if soil_present and xgb is not None:
-            model_input = np.array(soil_values).reshape(1, -1)
+    return JSONResponse({
+    "model_used": "soil",
+    "soil_label": label,
+    "soil_confidence": float(confidence),
+    "severity": severity,
+    "shap_top_features": shap_top_features if shap_top_features else None
+})
 
-            try:
-                probs = xgb.predict_proba(model_input)[0]
-                idx = int(np.argmax(probs))
-                confidence = float(np.max(probs))
-                label = CLASS_LABELS[idx]
-            except:
-                label = "unknown"
-                confidence = 0.0
 
-            severity = "Low" if label == "healthy" else "High"
-
-            return {
-                "model_used": "soil",
-                "label": label,
-                "confidence": confidence,
-                "severity": severity
-            }
 
         return JSONResponse(
             {"error": "Model not available"},
