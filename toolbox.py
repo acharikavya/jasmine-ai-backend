@@ -77,6 +77,10 @@ def create_app():
         xgb = load_xgb()
     except Exception as e:
         print("XGB load error:", e)
+    print("CNN loaded:", cnn is not None)
+    print("XGB loaded:", xgb is not None)
+
+
 
     app = FastAPI()
 
