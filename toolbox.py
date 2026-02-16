@@ -1,29 +1,34 @@
 """
 toolbox.py
-Production-ready FastAPI backend with:
+Production-ready FastAPI backend:
+
 - CNN leaf disease model (.h5)
 - XGBoost soil model (.pkl)
-- GradCAM explainability
+- Stable GradCAM explainability
 - SHAP explainability
+- Advice generation
+- Render compatible
 
-Start on Render with:
+Start on Render:
 uvicorn toolbox:create_app --host 0.0.0.0 --port $PORT --factory
 """
 
 import io
 import base64
-import cv2
-import shap
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
+import cv2
 import joblib
+import shap
 import tensorflow as tf
-from tensorflow.keras.models import load_model
+from tensorflow.keras.models import load_model, Model
+
 from fastapi import FastAPI, File, UploadFile, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+
 
 # =========================
 # PATH CONFIG
@@ -43,6 +48,25 @@ SOIL_FEATURES = [
 ]
 
 # =========================
+# ADVICE SYSTEM
+# =========================
+ADVICE_MAP = {
+    "Low": {
+        "healthy": "Plant looks healthy. Continue regular care and monitoring.",
+        "diseased": "Minor symptoms detected. Remove affected areas and monitor closely."
+    },
+    "Medium": {
+        "healthy": "Result uncertain. Monitor plant health and re-check in a few days.",
+        "diseased": "Moderate infection detected. Consider targeted treatment and monitor spread."
+    },
+    "High": {
+        "healthy": "High anomaly detected. Consider expert inspection.",
+        "diseased": "Severe infection detected. Isolate plant, remove damaged tissue, and consult an expert immediately."
+    }
+}
+
+
+# =========================
 # MODEL LOADERS
 # =========================
 def load_cnn():
@@ -60,6 +84,55 @@ def load_xgb():
 
 
 # =========================
+# GRADCAM FUNCTIONS
+# =========================
+def make_gradcam_heatmap(img_array, model, class_index):
+    # Find last Conv2D layer
+    last_conv_layer = None
+    for layer in reversed(model.layers):
+        if isinstance(layer, tf.keras.layers.Conv2D):
+            last_conv_layer = layer.name
+            break
+
+    if last_conv_layer is None:
+        raise ValueError("No Conv2D layer found for GradCAM.")
+
+    grad_model = Model(
+        inputs=model.input,
+        outputs=[
+            model.get_layer(last_conv_layer).output,
+            model.output
+        ]
+    )
+
+    with tf.GradientTape() as tape:
+        conv_outputs, predictions = grad_model(img_array)
+        loss = predictions[:, class_index]
+
+    grads = tape.gradient(loss, conv_outputs)
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+
+    conv_outputs = conv_outputs[0]
+    heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
+
+    heatmap = tf.maximum(heatmap, 0) / (tf.reduce_max(heatmap) + 1e-8)
+    heatmap = heatmap.numpy()
+
+    heatmap = cv2.resize(heatmap, DEFAULT_IMG_SIZE)
+    return heatmap
+
+
+def overlay_heatmap_on_image(original_pil, heatmap):
+    heatmap_uint8 = np.uint8(255 * heatmap)
+    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+
+    original = np.array(original_pil.resize(DEFAULT_IMG_SIZE))
+    overlay = cv2.addWeighted(original, 0.6, heatmap_color, 0.4, 0)
+
+    return overlay
+
+
+# =========================
 # APP FACTORY
 # =========================
 def create_app():
@@ -67,6 +140,7 @@ def create_app():
 
     cnn = None
     xgb = None
+    shap_explainer = None
 
     try:
         cnn = load_cnn()
@@ -75,16 +149,15 @@ def create_app():
 
     try:
         xgb = load_xgb()
+        shap_explainer = shap.TreeExplainer(xgb)
     except Exception as e:
         print("XGB load error:", e)
+
     print("CNN loaded:", cnn is not None)
     print("XGB loaded:", xgb is not None)
 
-
-
     app = FastAPI()
 
-    # CORS for Flutter/Web
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -103,7 +176,7 @@ def create_app():
         form = await request.form()
 
         # =========================
-        # CHECK SOIL INPUT
+        # SOIL MODE CHECK
         # =========================
         soil_values = []
         soil_present = False
@@ -151,60 +224,19 @@ def create_app():
                 "High" if confidence > 0.85 else "Medium"
             )
 
-            # -------- GRADCAM --------
+            advice = ADVICE_MAP.get(severity, {}).get(
+                label.lower(),
+                "Monitor plant health."
+            )
+
+            # GradCAM
             gradcam_overlay_b64 = None
-
             try:
-                last_conv_layer = None
-                for layer in reversed(cnn.layers):
-                    if "conv" in layer.name.lower():
-                        last_conv_layer = layer.name
-                        break
+                heatmap = make_gradcam_heatmap(img_array, cnn, idx)
+                overlay = overlay_heatmap_on_image(img, heatmap)
 
-                if last_conv_layer:
-                    grad_model = tf.keras.models.Model(
-                        [cnn.inputs],
-                        [cnn.get_layer(last_conv_layer).output, cnn.output],
-                    )
-
-                    with tf.GradientTape() as tape:
-                        conv_outputs, predictions = grad_model(img_array)
-                        loss = predictions[:, idx]
-
-                    grads = tape.gradient(loss, conv_outputs)
-                    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-
-                    conv_outputs = conv_outputs[0]
-                    heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
-                    heatmap = tf.squeeze(heatmap)
-
-                    heatmap = np.maximum(heatmap, 0) / (
-                        np.max(heatmap) + 1e-8
-                    )
-
-                    heatmap = cv2.resize(
-                        heatmap.numpy(), DEFAULT_IMG_SIZE
-                    )
-
-                    heatmap_uint8 = np.uint8(255 * heatmap)
-                    heatmap_color = cv2.applyColorMap(
-                        heatmap_uint8, cv2.COLORMAP_JET
-                    )
-
-                    overlay = cv2.addWeighted(
-                        np.array(img_resized),
-                        0.6,
-                        heatmap_color,
-                        0.4,
-                        0,
-                    )
-
-                    buff = io.BytesIO()
-                    Image.fromarray(overlay).save(buff, format="PNG")
-                    gradcam_overlay_b64 = base64.b64encode(
-                        buff.getvalue()
-                    ).decode()
-
+                _, buffer = cv2.imencode(".png", overlay)
+                gradcam_overlay_b64 = base64.b64encode(buffer).decode()
             except Exception as e:
                 print("GradCAM error:", e)
 
@@ -213,6 +245,7 @@ def create_app():
                 "label": label,
                 "confidence": confidence,
                 "severity": severity,
+                "advice": advice,
                 "gradcam_overlay_b64": gradcam_overlay_b64
             })
 
@@ -220,7 +253,6 @@ def create_app():
         # SOIL MODE
         # =========================
         if soil_present and xgb is not None:
-
             model_input = np.array(soil_values).reshape(1, -1)
 
             try:
@@ -235,11 +267,8 @@ def create_app():
             severity = "Low" if label == "healthy" else "High"
 
             shap_top_features = None
-
             try:
-                explainer = shap.TreeExplainer(xgb)
-                shap_values = explainer.shap_values(model_input)
-
+                shap_values = shap_explainer.shap_values(model_input)
                 values = shap_values[0] if isinstance(shap_values, list) else shap_values
                 values = values.flatten()
 
@@ -252,7 +281,6 @@ def create_app():
                     }
                     for i in top_indices
                 ]
-
             except Exception as e:
                 print("SHAP error:", e)
 
@@ -261,6 +289,7 @@ def create_app():
                 "soil_label": label,
                 "soil_confidence": confidence,
                 "severity": severity,
+                "advice": ADVICE_MAP.get(severity, {}).get(label.lower(), ""),
                 "shap_top_features": shap_top_features
             })
 
