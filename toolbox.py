@@ -31,7 +31,7 @@ from fastapi.middleware.cors import CORSMiddleware
 BASE_DIR = Path(__file__).resolve().parent
 MODELS_DIR = BASE_DIR / "models"
 
-CNN_PATH = MODELS_DIR / "CNN_model_render.keras"
+CNN_PATH = MODELS_DIR / "CNN_model_clean.h5"
 XGB_PATH = MODELS_DIR / "xgboost_soil_health_model.pkl"
 
 DEFAULT_IMG_SIZE = (224, 224)
