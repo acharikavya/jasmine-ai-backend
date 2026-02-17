@@ -57,18 +57,23 @@ def load_xgb():
 # GRADCAM
 # =========================
 def generate_gradcam(model, img_array, class_index):
+
+    # Find last Conv2D layer
     last_conv_layer = None
     for layer in reversed(model.layers):
-        if "conv" in layer.name.lower():
+        if isinstance(layer, tf.keras.layers.Conv2D):
             last_conv_layer = layer.name
             break
 
-    if not last_conv_layer:
+    if last_conv_layer is None:
+        print("No Conv2D layer found for GradCAM.")
         return None
 
+    print("Using GradCAM layer:", last_conv_layer)
+
     grad_model = Model(
-        [model.inputs],
-        [model.get_layer(last_conv_layer).output, model.output],
+        inputs=model.inputs,
+        outputs=[model.get_layer(last_conv_layer).output, model.output],
     )
 
     with tf.GradientTape() as tape:
@@ -76,16 +81,20 @@ def generate_gradcam(model, img_array, class_index):
         loss = predictions[:, class_index]
 
     grads = tape.gradient(loss, conv_outputs)
+
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-
     conv_outputs = conv_outputs[0]
-    heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
-    heatmap = tf.squeeze(heatmap)
 
-    heatmap = np.maximum(heatmap, 0) / (np.max(heatmap) + 1e-8)
-    heatmap = cv2.resize(heatmap.numpy(), DEFAULT_IMG_SIZE)
+    heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
+
+    heatmap = tf.maximum(heatmap, 0)
+    heatmap /= tf.reduce_max(heatmap) + 1e-8
+
+    heatmap = heatmap.numpy()
+    heatmap = cv2.resize(heatmap, DEFAULT_IMG_SIZE)
 
     return heatmap
+
 
 
 def overlay_heatmap(original_img, heatmap):
@@ -185,6 +194,8 @@ def create_app():
             severity = "Low" if label == "healthy" else (
                 "High" if confidence > 0.85 else "Medium"
             )
+            print("GradCAM generated:", gradcam_overlay_b64 is not None)
+
 
             # Leaf Advice
             if label == "healthy":
