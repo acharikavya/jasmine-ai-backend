@@ -4,7 +4,7 @@ Unified production backend:
 - CNN (.h5)
 - XGBoost (.pkl)
 - GradCAM
-- SHAP
+- SHAP (safe initialization)
 - Unified JSON structure
 """
 
@@ -112,7 +112,14 @@ def create_app():
     cnn = load_cnn()
     xgb = load_xgb()
 
-    shap_explainer = shap.TreeExplainer(xgb)
+    # SAFE SHAP INITIALIZATION
+    shap_explainer = None
+    try:
+        shap_explainer = shap.TreeExplainer(xgb)
+        print("SHAP initialized successfully.")
+    except Exception as e:
+        print("SHAP initialization failed:", e)
+        shap_explainer = None
 
     app = FastAPI()
 
@@ -175,12 +182,11 @@ def create_app():
             confidence = float(np.max(preds))
             label = CLASS_LABELS[idx]
 
-            # Severity logic
             severity = "Low" if label == "healthy" else (
                 "High" if confidence > 0.85 else "Medium"
             )
 
-            # Separate leaf advice
+            # Leaf Advice
             if label == "healthy":
                 advice = "Leaf looks healthy. Maintain watering and sunlight schedule."
             else:
@@ -226,28 +232,30 @@ def create_app():
 
             severity = "Low" if label == "healthy" else "High"
 
-            # Separate soil advice
+            # Soil Advice
             if label == "healthy":
                 advice = "Soil nutrients appear balanced. Continue current fertilization plan."
             else:
                 advice = "Soil imbalance detected. Adjust pH and nutrient levels. Consider soil treatment."
 
             shap_top_features = None
-            try:
-                shap_values = shap_explainer.shap_values(model_input)
-                values = shap_values[0] if isinstance(shap_values, list) else shap_values
-                values = values.flatten()
-                top_indices = np.argsort(np.abs(values))[-3:][::-1]
 
-                shap_top_features = [
-                    {
-                        "feature": SOIL_FEATURES[i],
-                        "impact": float(values[i]),
-                    }
-                    for i in top_indices
-                ]
-            except Exception as e:
-                print("SHAP error:", e)
+            if shap_explainer is not None:
+                try:
+                    shap_values = shap_explainer.shap_values(model_input)
+                    values = shap_values[0] if isinstance(shap_values, list) else shap_values
+                    values = values.flatten()
+                    top_indices = np.argsort(np.abs(values))[-3:][::-1]
+
+                    shap_top_features = [
+                        {
+                            "feature": SOIL_FEATURES[i],
+                            "impact": float(values[i]),
+                        }
+                        for i in top_indices
+                    ]
+                except Exception as e:
+                    print("SHAP runtime error:", e)
 
             return {
                 "model_used": "soil",
