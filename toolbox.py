@@ -58,7 +58,6 @@ def load_xgb():
 # =========================
 def generate_gradcam(model, img_array, class_index):
 
-    # Find last Conv2D layer
     last_conv_layer = None
     for layer in reversed(model.layers):
         if isinstance(layer, tf.keras.layers.Conv2D):
@@ -66,7 +65,7 @@ def generate_gradcam(model, img_array, class_index):
             break
 
     if last_conv_layer is None:
-        print("No Conv2D layer found for GradCAM.")
+        print("No Conv2D layer found.")
         return None
 
     print("Using GradCAM layer:", last_conv_layer)
@@ -81,20 +80,18 @@ def generate_gradcam(model, img_array, class_index):
         loss = predictions[:, class_index]
 
     grads = tape.gradient(loss, conv_outputs)
-
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
     conv_outputs = conv_outputs[0]
 
     heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
-
     heatmap = tf.maximum(heatmap, 0)
     heatmap /= tf.reduce_max(heatmap) + 1e-8
 
-    heatmap = heatmap.numpy()
+    if isinstance(heatmap, tf.Tensor):
+        heatmap = heatmap.numpy()
+
     heatmap = cv2.resize(heatmap, DEFAULT_IMG_SIZE)
-
     return heatmap
-
 
 
 def overlay_heatmap(original_img, heatmap):
@@ -121,14 +118,12 @@ def create_app():
     cnn = load_cnn()
     xgb = load_xgb()
 
-    # SAFE SHAP INITIALIZATION
     shap_explainer = None
     try:
         shap_explainer = shap.TreeExplainer(xgb)
-        print("SHAP initialized successfully.")
+        print("SHAP initialized.")
     except Exception as e:
-        print("SHAP initialization failed:", e)
-        shap_explainer = None
+        print("SHAP disabled:", e)
 
     app = FastAPI()
 
@@ -194,8 +189,6 @@ def create_app():
             severity = "Low" if label == "healthy" else (
                 "High" if confidence > 0.85 else "Medium"
             )
-            print("GradCAM generated:", gradcam_overlay_b64 is not None)
-
 
             # Leaf Advice
             if label == "healthy":
@@ -208,7 +201,6 @@ def create_app():
                 else:
                     advice = "Minor symptoms observed. Keep monitoring plant."
 
-            # GradCAM
             gradcam_overlay_b64 = None
             try:
                 heatmap = generate_gradcam(cnn, img_array, idx)
@@ -243,7 +235,6 @@ def create_app():
 
             severity = "Low" if label == "healthy" else "High"
 
-            # Soil Advice
             if label == "healthy":
                 advice = "Soil nutrients appear balanced. Continue current fertilization plan."
             else:
