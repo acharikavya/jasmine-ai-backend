@@ -11,7 +11,6 @@ Unified production backend:
 import io
 import base64
 import cv2
-import shap
 from pathlib import Path
 
 import numpy as np
@@ -30,7 +29,7 @@ BASE_DIR = Path(__file__).resolve().parent
 MODELS_DIR = BASE_DIR / "models"
 
 CNN_PATH = MODELS_DIR / "CNN_model_clean.h5"
-XGB_PATH = MODELS_DIR / "xgboost_soil_health_model.pkl"
+XGB_PATH = MODELS_DIR / "soil_ml_model.pkl"
 
 DEFAULT_IMG_SIZE = (224, 224)
 CLASS_LABELS = ["healthy", "diseased"]
@@ -118,12 +117,12 @@ def create_app():
     cnn = load_cnn()
     xgb = load_xgb()
 
-    shap_explainer = None
-    try:
-        shap_explainer = shap.TreeExplainer(xgb)
-        print("SHAP initialized.")
-    except Exception as e:
-        print("SHAP disabled:", e)
+    #shap_explainer = None
+   # try:
+        
+        #print("SHAP initialized.")
+    #except Exception as e:
+        #print("SHAP disabled:", e)
 
     app = FastAPI()
 
@@ -240,32 +239,16 @@ def create_app():
             else:
                 advice = "Soil imbalance detected. Adjust pH and nutrient levels. Consider soil treatment."
 
-            shap_top_features = None
+            
 
-            if shap_explainer is not None:
-                try:
-                    shap_values = shap_explainer.shap_values(model_input)
-                    values = shap_values[0] if isinstance(shap_values, list) else shap_values
-                    values = values.flatten()
-                    top_indices = np.argsort(np.abs(values))[-3:][::-1]
-
-                    shap_top_features = [
-                        {
-                            "feature": SOIL_FEATURES[i],
-                            "impact": float(values[i]),
-                        }
-                        for i in top_indices
-                    ]
-                except Exception as e:
-                    print("SHAP runtime error:", e)
-
+            
             return {
                 "model_used": "soil",
                 "label": label,
                 "confidence": confidence,
                 "severity": severity,
                 "advice": advice,
-                "shap_top_features": shap_top_features
+                "shap_top_features": None
             }
 
         return JSONResponse(
