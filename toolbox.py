@@ -1,11 +1,10 @@
 """
 toolbox.py
-Unified production backend:
-- CNN (.h5)
-- XGBoost (.pkl)
-- GradCAM
-- SHAP (safe initialization)
-- Unified JSON structure
+Final Fixed Version
+- Image + Soil prediction working
+- Swagger shows soil fields
+- Correct model loading
+- GradCAM working
 """
 
 import io
@@ -18,7 +17,8 @@ from PIL import Image
 import joblib
 import tensorflow as tf
 from tensorflow.keras.models import load_model, Model
-from fastapi import FastAPI, File, UploadFile, Request
+
+from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -33,11 +33,6 @@ XGB_PATH = MODELS_DIR / "soil_ml_model.pkl"
 
 DEFAULT_IMG_SIZE = (224, 224)
 CLASS_LABELS = ["healthy", "diseased"]
-
-SOIL_FEATURES = [
-    "PH", "EC ds/m", "OC %", "N kg/hectre", "P kg/hectre", "K kg/hectre",
-    "S ppm", "Zn ppm", "B ppm", "Fe ppm", "Mn ppm", "Cu ppm"
-]
 
 # =========================
 # MODEL LOADERS
@@ -64,10 +59,7 @@ def generate_gradcam(model, img_array, class_index):
             break
 
     if last_conv_layer is None:
-        print("No Conv2D layer found.")
         return None
-
-    print("Using GradCAM layer:", last_conv_layer)
 
     grad_model = Model(
         inputs=model.inputs,
@@ -117,13 +109,6 @@ def create_app():
     cnn = load_cnn()
     xgb = load_xgb()
 
-    #shap_explainer = None
-   # try:
-        
-        #print("SHAP initialized.")
-    #except Exception as e:
-        #print("SHAP disabled:", e)
-
     app = FastAPI()
 
     app.add_middleware(
@@ -138,33 +123,52 @@ def create_app():
     async def root():
         return {"status": "ok", "message": "Jasmine AI Backend Running"}
 
+    # =========================
+    # PREDICT API
+    # =========================
     @app.post("/predict")
-    async def predict(request: Request, image: UploadFile = File(None)):
+    async def predict(
+        image: UploadFile = File(None),
 
-        form = await request.form()
+        # Soil Inputs (Swagger Friendly)
+        PH: float = Form(None),
+        EC_ds_m: float = Form(None),
+        OC: float = Form(None),
+        N: float = Form(None),
+        P: float = Form(None),
+        K: float = Form(None),
+        S: float = Form(None),
+        Zn: float = Form(None),
+        B: float = Form(None),
+        Fe: float = Form(None),
+        Mn: float = Form(None),
+        Cu: float = Form(None),
+    ):
 
         # =========================
-        # SOIL CHECK
+        # SOIL DATA
         # =========================
-        soil_values = []
-        soil_present = False
+        soil_values = [
+            PH or 0,
+            EC_ds_m or 0,
+            OC or 0,
+            N or 0,
+            P or 0,
+            K or 0,
+            S or 0,
+            Zn or 0,
+            B or 0,
+            Fe or 0,
+            Mn or 0,
+            Cu or 0,
+        ]
 
-        for feature in SOIL_FEATURES:
-            value = form.get(feature)
-            if value:
-                soil_present = True
-                try:
-                    soil_values.append(float(value))
-                except:
-                    soil_values.append(0.0)
-            else:
-                soil_values.append(0.0)
-
-        image_present = image is not None
+        soil_present = any(v != 0 for v in soil_values)
+        image_present = image is not None and image.filename != ""
 
         if not image_present and not soil_present:
             return JSONResponse(
-                {"error": "Provide either leaf image or soil data"},
+                {"error": "Provide either image or soil data"},
                 status_code=400,
             )
 
@@ -172,7 +176,6 @@ def create_app():
         # IMAGE MODE
         # =========================
         if image_present:
-
             contents = await image.read()
             img = Image.open(io.BytesIO(contents)).convert("RGB")
 
@@ -189,16 +192,11 @@ def create_app():
                 "High" if confidence > 0.85 else "Medium"
             )
 
-            # Leaf Advice
-            if label == "healthy":
-                advice = "Leaf looks healthy. Maintain watering and sunlight schedule."
-            else:
-                if severity == "High":
-                    advice = "Severe infection detected. Remove infected leaves and apply treatment immediately."
-                elif severity == "Medium":
-                    advice = "Moderate disease detected. Monitor closely and consider treatment."
-                else:
-                    advice = "Minor symptoms observed. Keep monitoring plant."
+            advice = (
+                "Leaf looks healthy."
+                if label == "healthy"
+                else "Disease detected. Apply treatment."
+            )
 
             gradcam_overlay_b64 = None
             try:
@@ -224,7 +222,6 @@ def create_app():
         # SOIL MODE
         # =========================
         if soil_present:
-
             model_input = np.array(soil_values).reshape(1, -1)
 
             probs = xgb.predict_proba(model_input)[0]
@@ -234,26 +231,21 @@ def create_app():
 
             severity = "Low" if label == "healthy" else "High"
 
-            if label == "healthy":
-                advice = "Soil nutrients appear balanced. Continue current fertilization plan."
-            else:
-                advice = "Soil imbalance detected. Adjust pH and nutrient levels. Consider soil treatment."
+            advice = (
+                "Soil nutrients balanced."
+                if label == "healthy"
+                else "Soil imbalance detected. Improve nutrients."
+            )
 
-            
-
-            
             return {
                 "model_used": "soil",
                 "label": label,
                 "confidence": confidence,
                 "severity": severity,
                 "advice": advice,
-                "shap_top_features": None
             }
 
-        return JSONResponse(
-            {"error": "Model not available"},
-            status_code=500,
-        )
+        return JSONResponse({"error": "Something went wrong"}, status_code=500)
 
     return app
+
