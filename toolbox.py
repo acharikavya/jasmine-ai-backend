@@ -1,12 +1,3 @@
-"""
-toolbox.py
-Final Fixed Version
-- Image + Soil prediction working
-- Swagger shows soil fields
-- Correct model loading
-- GradCAM working
-"""
-
 import io
 import base64
 import cv2
@@ -18,7 +9,7 @@ import joblib
 import tensorflow as tf
 from tensorflow.keras.models import load_model, Model
 
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, File, UploadFile, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -51,7 +42,6 @@ def load_xgb():
 # GRADCAM
 # =========================
 def generate_gradcam(model, img_array, class_index):
-
     last_conv_layer = None
     for layer in reversed(model.layers):
         if isinstance(layer, tf.keras.layers.Conv2D):
@@ -78,9 +68,7 @@ def generate_gradcam(model, img_array, class_index):
     heatmap = tf.maximum(heatmap, 0)
     heatmap /= tf.reduce_max(heatmap) + 1e-8
 
-    if isinstance(heatmap, tf.Tensor):
-        heatmap = heatmap.numpy()
-
+    heatmap = heatmap.numpy()
     heatmap = cv2.resize(heatmap, DEFAULT_IMG_SIZE)
     return heatmap
 
@@ -121,66 +109,50 @@ def create_app():
 
     @app.get("/")
     async def root():
-        return {"status": "ok", "message": "Jasmine AI Backend Running"}
+        return {"status": "ok", "message": "Backend Running"}
 
     # =========================
     # PREDICT API
     # =========================
     @app.post("/predict")
-    async def predict(
-        image: UploadFile = File(None),
+    async def predict(request: Request, image: UploadFile = File(None)):
 
-        # Soil Inputs (Swagger Friendly)
-        PH: float = Form(None),
-        EC_ds_m: float = Form(None),
-        OC: float = Form(None),
-        N: float = Form(None),
-        P: float = Form(None),
-        K: float = Form(None),
-        S: float = Form(None),
-        Zn: float = Form(None),
-        B: float = Form(None),
-        Fe: float = Form(None),
-        Mn: float = Form(None),
-        Cu: float = Form(None),
-    ):
+        form = await request.form()
 
-        # =========================
-        # SOIL DATA
-        # =========================
-        soil_values = [
-            PH or 0,
-            EC_ds_m or 0,
-            OC or 0,
-            N or 0,
-            P or 0,
-            K or 0,
-            S or 0,
-            Zn or 0,
-            B or 0,
-            Fe or 0,
-            Mn or 0,
-            Cu or 0,
+        keys = [
+            "PH", "EC_ds_m", "OC", "N", "P", "K",
+            "S", "Zn", "B", "Fe", "Mn", "Cu"
         ]
 
-        soil_present = any(v != 0 for v in soil_values)
+        soil_values = []
+        soil_present = False
+
+        for key in keys:
+            value = form.get(key)
+            if value:
+                soil_present = True
+                try:
+                    soil_values.append(float(value))
+                except:
+                    soil_values.append(0.0)
+            else:
+                soil_values.append(0.0)
+
         image_present = image is not None and image.filename != ""
 
         if not image_present and not soil_present:
             return JSONResponse(
-                {"error": "Provide either image or soil data"},
+                {"error": "Provide image or soil data"},
                 status_code=400,
             )
 
-        # =========================
-        # IMAGE MODE
-        # =========================
+        # ================= IMAGE =================
         if image_present:
             contents = await image.read()
             img = Image.open(io.BytesIO(contents)).convert("RGB")
 
-            img_resized = img.resize(DEFAULT_IMG_SIZE)
-            img_array = np.array(img_resized).astype("float32") / 255.0
+            img = img.resize(DEFAULT_IMG_SIZE)
+            img_array = np.array(img).astype("float32") / 255.0
             img_array = np.expand_dims(img_array, axis=0)
 
             preds = cnn.predict(img_array)[0]
@@ -188,39 +160,13 @@ def create_app():
             confidence = float(np.max(preds))
             label = CLASS_LABELS[idx]
 
-            severity = "Low" if label == "healthy" else (
-                "High" if confidence > 0.85 else "Medium"
-            )
-
-            advice = (
-                "Leaf looks healthy."
-                if label == "healthy"
-                else "Disease detected. Apply treatment."
-            )
-
-            gradcam_overlay_b64 = None
-            try:
-                heatmap = generate_gradcam(cnn, img_array, idx)
-                if heatmap is not None:
-                    overlay = overlay_heatmap(img, heatmap)
-                    buff = io.BytesIO()
-                    Image.fromarray(overlay).save(buff, format="PNG")
-                    gradcam_overlay_b64 = base64.b64encode(buff.getvalue()).decode()
-            except Exception as e:
-                print("GradCAM error:", e)
-
             return {
                 "model_used": "image",
                 "label": label,
                 "confidence": confidence,
-                "severity": severity,
-                "advice": advice,
-                "gradcam_overlay_b64": gradcam_overlay_b64
             }
 
-        # =========================
-        # SOIL MODE
-        # =========================
+        # ================= SOIL =================
         if soil_present:
             model_input = np.array(soil_values).reshape(1, -1)
 
@@ -229,20 +175,10 @@ def create_app():
             confidence = float(np.max(probs))
             label = CLASS_LABELS[idx]
 
-            severity = "Low" if label == "healthy" else "High"
-
-            advice = (
-                "Soil nutrients balanced."
-                if label == "healthy"
-                else "Soil imbalance detected. Improve nutrients."
-            )
-
             return {
                 "model_used": "soil",
                 "label": label,
                 "confidence": confidence,
-                "severity": severity,
-                "advice": advice,
             }
 
         return JSONResponse({"error": "Something went wrong"}, status_code=500)
