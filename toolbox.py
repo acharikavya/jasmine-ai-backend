@@ -1,5 +1,5 @@
+
 import io
-import base64
 import cv2
 from pathlib import Path
 
@@ -26,7 +26,7 @@ DEFAULT_IMG_SIZE = (224, 224)
 CLASS_LABELS = ["healthy", "diseased"]
 
 # =========================
-# MODEL LOADERS
+# LOAD MODELS
 # =========================
 def load_cnn():
     print("Loading CNN from:", CNN_PATH)
@@ -34,57 +34,8 @@ def load_cnn():
 
 
 def load_xgb():
-    print("Loading XGBoost from:", XGB_PATH)
+    print("Loading XGB from:", XGB_PATH)
     return joblib.load(str(XGB_PATH))
-
-
-# =========================
-# GRADCAM
-# =========================
-def generate_gradcam(model, img_array, class_index):
-    last_conv_layer = None
-    for layer in reversed(model.layers):
-        if isinstance(layer, tf.keras.layers.Conv2D):
-            last_conv_layer = layer.name
-            break
-
-    if last_conv_layer is None:
-        return None
-
-    grad_model = Model(
-        inputs=model.inputs,
-        outputs=[model.get_layer(last_conv_layer).output, model.output],
-    )
-
-    with tf.GradientTape() as tape:
-        conv_outputs, predictions = grad_model(img_array)
-        loss = predictions[:, class_index]
-
-    grads = tape.gradient(loss, conv_outputs)
-    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-    conv_outputs = conv_outputs[0]
-
-    heatmap = tf.reduce_sum(conv_outputs * pooled_grads, axis=-1)
-    heatmap = tf.maximum(heatmap, 0)
-    heatmap /= tf.reduce_max(heatmap) + 1e-8
-
-    heatmap = heatmap.numpy()
-    heatmap = cv2.resize(heatmap, DEFAULT_IMG_SIZE)
-    return heatmap
-
-
-def overlay_heatmap(original_img, heatmap):
-    heatmap_uint8 = np.uint8(255 * heatmap)
-    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
-
-    overlay = cv2.addWeighted(
-        np.array(original_img.resize(DEFAULT_IMG_SIZE)),
-        0.6,
-        heatmap_color,
-        0.4,
-        0,
-    )
-    return overlay
 
 
 # =========================
@@ -92,13 +43,14 @@ def overlay_heatmap(original_img, heatmap):
 # =========================
 def create_app():
 
-    print("Starting Jasmine AI backend...")
+    print("Starting backend...")
 
     cnn = load_cnn()
     xgb = load_xgb()
 
     app = FastAPI()
 
+    # ✅ CORS FIX
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -109,7 +61,7 @@ def create_app():
 
     @app.get("/")
     async def root():
-        return {"status": "ok", "message": "Backend Running"}
+        return {"status": "ok"}
 
     # =========================
     # PREDICT API
@@ -119,6 +71,9 @@ def create_app():
 
         form = await request.form()
 
+        # =========================
+        # SOIL INPUT
+        # =========================
         keys = [
             "PH", "EC_ds_m", "OC", "N", "P", "K",
             "S", "Zn", "B", "Fe", "Mn", "Cu"
@@ -138,17 +93,33 @@ def create_app():
             else:
                 soil_values.append(0.0)
 
-        image_present = image is not None and image.filename != ""
+        # =========================
+        # SAFE IMAGE CHECK (FIXED)
+        # =========================
+        image_present = False
+        contents = None
 
+        if image is not None:
+            try:
+                contents = await image.read()
+                if contents and len(contents) > 0:
+                    image_present = True
+            except:
+                image_present = False
+
+        # =========================
+        # VALIDATION
+        # =========================
         if not image_present and not soil_present:
             return JSONResponse(
                 {"error": "Provide image or soil data"},
                 status_code=400,
             )
 
-        # ================= IMAGE =================
+        # =========================
+        # IMAGE MODE
+        # =========================
         if image_present:
-            contents = await image.read()
             img = Image.open(io.BytesIO(contents)).convert("RGB")
 
             img = img.resize(DEFAULT_IMG_SIZE)
@@ -164,9 +135,15 @@ def create_app():
                 "model_used": "image",
                 "label": label,
                 "confidence": confidence,
+                "severity": "Low" if label == "healthy" else "High",
+                "advice": "Leaf healthy"
+                if label == "healthy"
+                else "Disease detected",
             }
 
-        # ================= SOIL =================
+        # =========================
+        # SOIL MODE
+        # =========================
         if soil_present:
             model_input = np.array(soil_values).reshape(1, -1)
 
@@ -179,9 +156,12 @@ def create_app():
                 "model_used": "soil",
                 "label": label,
                 "confidence": confidence,
+                "severity": "Low" if label == "healthy" else "High",
+                "advice": "Soil balanced"
+                if label == "healthy"
+                else "Soil needs improvement",
             }
 
         return JSONResponse({"error": "Something went wrong"}, status_code=500)
 
     return app
-
