@@ -20,7 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent
 MODELS_DIR = BASE_DIR / "models"
 
 CNN_PATH = MODELS_DIR / "CNN_model_clean.h5"
-XGB_PATH = MODELS_DIR / "soil_ml_model.pkl"
+XGB_PATH = MODELS_DIR / "soil_xgboost_model.pkl"
 
 DEFAULT_IMG_SIZE = (224, 224)
 CLASS_LABELS = ["healthy", "diseased"]
